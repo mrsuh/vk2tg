@@ -1,5 +1,6 @@
 {
     "require": {
+        "ext-json": "*",
         "telegram-bot/api": "^2.3",
         "symfony/monolog-bundle": "^3.3",
         "monolog/monolog": "^1.24"

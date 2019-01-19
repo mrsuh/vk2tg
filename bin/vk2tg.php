@@ -6,6 +6,102 @@ use TelegramBot\Api\BotApi;
 
 require __DIR__ . '/../vendor/autoload.php';
 
+class LimitedList
+{
+    /** @var int[] */
+    private $list;
+
+    /** @var int */
+    private $limit;
+
+    public function __construct(int $limit)
+    {
+        $this->list  = [];
+        $this->limit = $limit;
+    }
+
+    /**
+     * @param $item
+     */
+    public function push(int $item): void
+    {
+        while (count($this->list) >= $this->limit) {
+            array_shift($this->list);
+        }
+
+        array_push($this->list, $item);
+    }
+
+    /**
+     * @param $item
+     * @return bool
+     */
+    public function has($item): bool
+    {
+        return in_array($item, $this->list);
+    }
+}
+
+class Storage
+{
+    /** @var int */
+    private $lastDate;
+
+    /** @var LimitedList */
+    private $lastIds;
+
+    public function __construct()
+    {
+        $this->lastDate = time();
+        $this->lastIds  = new LimitedList(20);
+    }
+
+    public function setLastDate(int $lastDate): void
+    {
+        $this->lastDate = $lastDate;
+    }
+
+    public function getLastDate(): int
+    {
+        return $this->lastDate;
+    }
+
+    public function addId(int $id): void
+    {
+        $this->lastIds->push($id);
+    }
+
+    public function hasId(int $id): bool
+    {
+        return $this->lastIds->has($id);
+    }
+
+    public function save(): void
+    {
+        file_put_contents(__DIR__ . '/../storage.json', serialize($this));
+    }
+
+    public static function load(): Storage
+    {
+        $filePath = __DIR__ . '/../storage.json';
+        if (!file_exists($filePath)) {
+            return new Storage();
+        }
+
+        $content = file_get_contents($filePath);
+        if (empty($content)) {
+            return new Storage();
+        }
+
+        $storage = unserialize($content);
+        if (!$storage instanceof Storage) {
+            return new Storage();
+        }
+
+        return $storage;
+    }
+}
+
 class Vk2Tg
 {
     /** @var BotApi */
@@ -20,24 +116,20 @@ class Vk2Tg
     /** @var string */
     private $vkToken;
 
-    /** @var string */
-    private $vkLastPostDateFile;
-
-    /** @var int */
-    private $vkLastPostDate;
-
     /** @var \Psr\Log\LoggerInterface */
     private $logger;
 
+    /** @var Storage */
+    private $storage;
+
     public function __construct()
     {
-        $this->vkToken            = getenv('VK_TOKEN');
-        $this->vkGroupId          = getenv('VK_GROUP_ID');
-        $this->vkLastPostDateFile = __DIR__ . '/../vk_last_post_date.txt';
-        $this->vkLastPostDate     = file_exists($this->vkLastPostDateFile) ? (int)file_get_contents($this->vkLastPostDateFile) : 0;
-        $this->tgBot              = new BotApi(getenv('TG_BOT_TOKEN'));
-        $this->tgChannelId        = getenv('TG_CHANNEL_ID');
-        $tgProxyDSN               = getenv('TG_PROXY_DSN');
+        $this->vkToken     = getenv('VK_TOKEN');
+        $this->vkGroupId   = getenv('VK_GROUP_ID');
+        $this->storage     = Storage::load();
+        $this->tgBot       = new BotApi(getenv('TG_BOT_TOKEN'));
+        $this->tgChannelId = getenv('TG_CHANNEL_ID');
+        $tgProxyDSN        = getenv('TG_PROXY_DSN');
         if (!empty($tgProxyDSN)) {
             $this->tgBot->setProxy($tgProxyDSN);
         }
@@ -72,24 +164,22 @@ class Vk2Tg
             return;
         }
 
-        $lastPostDateInit  = false;
-        $vkLastPostDateTmp = $this->vkLastPostDate;
+        $vkLastPostDateTmp = 0;
         foreach ($vkData['response']['items'] as $vkIndex => $vkItem) {
-            $vkItemId = $vkItem['id'];
+            $vkItemId = (int)$vkItem['id'];
             if (isset($vkItem['is_pinned']) && $vkItem['is_pinned']) {
-                $this->logger->debug('Skip post', ['reason' => 'is_pinned', 'id' => $vkItemId]);
+                $this->logger->debug('Skip post', ['reason' => 'is pinned', 'id' => $vkItemId]);
                 continue;
             }
 
-            if ((int)$vkItem['date'] <= (int)$this->vkLastPostDate) {
-                $this->logger->debug('Skip post', ['reason' => 'same date', 'id' => $vkItemId, 'date' => $vkItem['date']]);
+            if ((int)$vkItem['date'] <= $this->storage->getLastDate()) {
+                $this->logger->debug('Skip post', ['reason' => 'already posted by date', 'id' => $vkItemId, 'date' => $vkItem['date']]);
                 break;
             }
 
-            if (!$lastPostDateInit) {
-                $this->logger->debug('Set new last post tmp date', ['date' => $vkItem['date']]);
+            if (0 === $vkLastPostDateTmp && $this->storage->getLastDate() < (int)$vkItem['date']) {
+                $this->logger->debug('Set new last post date', ['date' => $vkItem['date']]);
                 $vkLastPostDateTmp = (int)$vkItem['date'];
-                $lastPostDateInit  = true;
             }
 
             if ((int)$vkItem['from_id'] !== (int)$this->vkGroupId) {
@@ -98,9 +188,16 @@ class Vk2Tg
             }
 
             if ($vkItem['marked_as_ads']) {
-                $this->logger->debug('Skip post', ['reason' => 'marked_as_ads', 'id' => $vkItemId]);
+                $this->logger->debug('Skip post', ['reason' => 'marked as ads', 'id' => $vkItemId]);
                 continue;
             }
+
+            if ($this->storage->hasId($vkItemId)) {
+                $this->logger->debug('Skip post', ['reason' => 'already posted by id', 'id' => $vkItemId]);
+                continue;
+            }
+
+            $this->storage->addId($vkItemId);
 
             $text   = $vkItem['text'];
             $links  = [];
@@ -147,7 +244,7 @@ class Vk2Tg
                     }
                 }
 
-                return;
+                break;
             }
 
             foreach ($links as $title => $url) {
@@ -173,8 +270,11 @@ class Vk2Tg
             }
         }
 
-        $this->vkLastPostDate = $vkLastPostDateTmp;
-        file_put_contents($this->vkLastPostDateFile, $vkLastPostDateTmp);
+        if (0 !== $vkLastPostDateTmp) {
+            $this->storage->setLastDate($vkLastPostDateTmp);
+        }
+
+        $this->storage->save();
     }
 }
 
